@@ -4,14 +4,24 @@ import (
 	"fmt"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"os"
 )
 
-var MinioEndpoint = "127.0.0.1:9000"
 var MinioBucket = "testgo"
 var MinioFolder = "images/"
 
+func GetMinioEndpoint() string {
+	host := "127.0.0.1"
+	if os.Getenv("MINIO_HOST") != "" {
+		host = os.Getenv("MINIO_HOST")
+	}
+	port := "9000"
+	url := fmt.Sprintf("%s:%s", host, port)
+	return url
+}
+
 func GetMinioClient() (*minio.Client, error) {
-	endpoint := MinioEndpoint
+	endpoint := GetMinioEndpoint()
 	accessKeyID := "root"
 	secretAccessKey := "g35y13tagrgh"
 

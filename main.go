@@ -6,13 +6,11 @@ import (
 	"fmt"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/go-playground/validator/v10"
-	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 	"github.com/minio/minio-go/v7"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/context"
-	"log"
+	"myproj/database"
 	"myproj/minio-client"
 	"net/http"
 	"strings"
@@ -26,29 +24,16 @@ type AuthUser struct {
 	Password string `json:"password" validate:"required"`
 }
 
-type userRead struct {
-	ID       int     `json:"id" db:"id"`
-	Username *string `json:"username" db:"username"`
-	Email    string  `json:"email" db:"email"`
-	Password string  `json:"-" db:"password"`
-}
-
 type User struct {
-	Username string `json:"username" db:"username"`
-	Email    string `json:"email" validate:"required" db:"email"`
-	Password string `json:"password" validate:"required" db:"password"`
+	Username string `json:"username"`
+	Email    string `json:"email" validate:"required"`
+	Password string `json:"password" validate:"required"`
 }
 
 type Token struct {
-	ID    int    `json:"id"`
+	ID    uint   `json:"id"`
 	Email string `json:"email"`
 	jwt.StandardClaims
-}
-
-type File struct {
-	UUID     uuid.UUID `json:"-" db:"uuid"`
-	UserId   int       `json:"-" db:"user_id"`
-	Filepath string    `json:"filepath" db:"filepath"`
 }
 
 func (user User) hash_password() string {
@@ -111,19 +96,6 @@ func loadBody2[T any](response http.ResponseWriter, request *http.Request, error
 	return loadStruct, err
 }
 
-func initDbConnect() (*sqlx.DB, func()) {
-	pool, err := sqlx.Connect("postgres", "host=localhost port=5432 user=postgres password=123 dbname=testgo sslmode=disable")
-	if err != nil {
-		log.Println("m=GetPool,msg=connection has failed", err)
-	}
-	return pool, func() {
-		err := pool.Close()
-		if err != nil {
-			fmt.Println(err.Error())
-		}
-	}
-}
-
 func ValidateToken(bearerToken string) (*jwt.Token, error) {
 	tokenString := strings.Split(bearerToken, " ")[1]
 	token, err := jwt.ParseWithClaims(tokenString, &Token{}, func(token *jwt.Token) (interface{}, error) {
@@ -166,13 +138,19 @@ func signUp(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 	hashedPassword := validatedUser.hash_password()
-	validatedUser.Password = hashedPassword
-	pool, dbClose := initDbConnect()
-	defer dbClose()
-	_, err = pool.NamedExec("INSERT INTO public.user (email, password) VALUES (:email, :password)", &validatedUser)
-	if err != nil {
-		fmt.Println(err.Error())
+	db := database.InitDbConnect()
+	if db == nil {
+		CustomError("Database error", http.StatusInternalServerError, response)
+		return
 	}
+	newUser := database.UserDB{
+		Email:    validatedUser.Email,
+		Password: hashedPassword,
+		Username: validatedUser.Username,
+	}
+	db.Create(&newUser)
+	response.WriteHeader(http.StatusCreated)
+	fmt.Fprint(response)
 
 }
 
@@ -187,13 +165,15 @@ func signIn(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	var user userRead
-	pool, dbClose := initDbConnect()
-	defer dbClose()
-	var query string
-	query = fmt.Sprintf("SELECT * FROM public.user where email = '%v'", validatedAuth.Email)
-	err = pool.Get(&user, query)
-	if err != nil {
+	var user database.UserDB
+	db := database.InitDbConnect()
+	if db == nil {
+		http.Error(response, "Database error", http.StatusInternalServerError)
+		return
+	}
+	query := db.First(&user, "email = ?", validatedAuth.Email)
+	if query.Error != nil {
+		fmt.Println(query.Error)
 		http.Error(response, "Unknown email", http.StatusUnauthorized)
 		return
 	}
@@ -223,7 +203,7 @@ func uploadFile(response http.ResponseWriter, request *http.Request) {
 		MethodNotAllowed("POST", response)
 		return
 	}
-	userId := request.Context().Value("user_id").(int)
+	userId := request.Context().Value("user_id").(uint)
 
 	err := request.ParseMultipartForm(10 << 20) // maxMemory 32MB
 	if err != nil {
@@ -259,21 +239,21 @@ func uploadFile(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	var newFile struct {
-		UserID   int    `db:"user_id"`
-		Filepath string `db:"filepath"`
+	db := database.InitDbConnect()
+	if db == nil {
+		http.Error(response, "Database error", http.StatusInternalServerError)
+		return
 	}
-	newFile.UserID = userId
-	newFile.Filepath = h.Filename
-
-	pool, dbClose := initDbConnect()
-	defer dbClose()
-	_, err = pool.NamedExec("INSERT INTO public.files (user_id, filepath) VALUES (:user_id, :filepath)", &newFile)
+	newFile := database.FileDB{
+		UserId:   userId,
+		Filepath: h.Filename,
+	}
+	db.Create(&newFile)
 
 	var resp struct {
 		Filepath string `json:"filepath"`
 	}
-	resp.Filepath = fmt.Sprintf("http://%s/%s/%s%s", minio_client.MinioEndpoint, minio_client.MinioBucket, minio_client.MinioFolder, h.Filename)
+	resp.Filepath = fmt.Sprintf("http://%s/%s/%s%s", minio_client.GetMinioEndpoint(), minio_client.MinioBucket, minio_client.MinioFolder, h.Filename)
 	filepathResponse, _ := json.Marshal(resp)
 	response.Write(filepathResponse)
 	fmt.Fprint(response)
@@ -284,22 +264,18 @@ func getFiles(response http.ResponseWriter, request *http.Request) {
 		MethodNotAllowed("GET", response)
 		return
 	}
-	userId := request.Context().Value("user_id").(int)
+	userId := request.Context().Value("user_id").(uint)
 
-	pool, dbClose := initDbConnect()
-	defer dbClose()
-	var files []File
-	var query string
-	query = fmt.Sprintf("SELECT * FROM public.files where user_id = '%v'", userId)
-	err := pool.Select(&files, query)
-	if err != nil {
-		fmt.Println(err)
-		CustomError("Error in database", http.StatusInternalServerError, response)
+	var files []database.FileDB
+	db := database.InitDbConnect()
+	if db == nil {
+		http.Error(response, "Database error", http.StatusInternalServerError)
 		return
 	}
+	db.Find(&files, "user_id = ?", userId)
 	responseFiles := make([]string, len(files))
 	for i, file := range files {
-		responseFiles[i] = fmt.Sprintf("http://%s/%s/%s%s", minio_client.MinioEndpoint, minio_client.MinioBucket, minio_client.MinioFolder, file.Filepath)
+		responseFiles[i] = fmt.Sprintf("http://%s/%s/%s%s", minio_client.GetMinioEndpoint(), minio_client.MinioBucket, minio_client.MinioFolder, file.Filepath)
 	}
 	filepathResponse, _ := json.Marshal(responseFiles)
 	response.Write(filepathResponse)
@@ -307,7 +283,7 @@ func getFiles(response http.ResponseWriter, request *http.Request) {
 }
 
 func main() {
-	initDbConnect()
+	Migration()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/sign-up/", signUp)
